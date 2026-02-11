@@ -25,8 +25,11 @@ COLORS = [
 ]
 
 # ── LLM 调用 ───────────────────────────────────────────
-def llm_reply(agent: dict, history: list[dict]) -> str:
-    """调用 OpenAI 兼容 API 生成回复（支持多 agent 上下文）"""
+def llm_reply(agent: dict, history: list[dict], visible_ids: set[str] | None = None) -> str:
+    """调用 OpenAI 兼容 API 生成回复。
+    visible_ids: 该 agent 能"听到"的其他 agent id 集合（基于连线拓扑）。
+    为 None 时表示能听到所有人（向后兼容）。
+    """
     api_key = os.getenv("OPENAI_API_KEY", "")
     base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
     if not api_key:
@@ -36,9 +39,10 @@ def llm_reply(agent: dict, history: list[dict]) -> str:
     for m in history:
         if m["agent_id"] == agent["id"]:
             messages.append({"role": "assistant", "content": m["content"]})
-        else:
-            # 多 agent 时用名字前缀区分不同发言者
+        elif visible_ids is None or m["agent_id"] in visible_ids:
+            # 只接收能"听到"的 agent 的消息
             messages.append({"role": "user", "content": f'[{m["name"]}]: {m["content"]}'})
+        # else: 没有连线 → 这条消息对当前 agent 不可见
     try:
         r = client.chat.completions.create(
             model=os.getenv("DEFAULT_MODEL", "gpt-3.5-turbo"),
@@ -134,6 +138,16 @@ def _remove_edges_for(aid: str):
     global edges
     edges = [e for e in edges if e["source"] != aid and e["target"] != aid]
 
+def _get_neighbors(aid: str) -> set[str]:
+    """根据 edges 返回与 aid 直接相连的所有 agent id"""
+    neighbors = set()
+    for e in edges:
+        if e["source"] == aid:
+            neighbors.add(e["target"])
+        elif e["target"] == aid:
+            neighbors.add(e["source"])
+    return neighbors
+
 def _parse_id(s: str) -> str | None:
     if not s:
         return None
@@ -181,7 +195,7 @@ def delete_edge(selection: str):
 
 # ── 对话 ───────────────────────────────────────────────
 def start_conversation(agent_selections: list[str], topic: str, turns: int):
-    """支持 N 个 agent 的群聊，按选中顺序轮流发言"""
+    """支持 N 个 agent 的群聊，按连线拓扑决定每个 agent 能听到谁"""
     if not agent_selections or len(agent_selections) < 2:
         return "Please select at least 2 agents to start a conversation."
 
@@ -194,24 +208,47 @@ def start_conversation(agent_selections: list[str], topic: str, turns: int):
     if len(participants) < 2:
         return "Need at least 2 valid agents."
 
+    participant_ids = {p["id"] for p in participants}
+
+    # 检查连通性：找出没有任何连线（在参与者中）的 agent
+    isolated = []
+    for p in participants:
+        neighbors = _get_neighbors(p["id"]) & participant_ids
+        if not neighbors:
+            isolated.append(p["name"])
+    if isolated:
+        return (f"**Cannot start**: {', '.join(isolated)} ha{'s' if len(isolated)==1 else 've'} "
+                f"no connections to other selected agents.\n\n"
+                f"Please go to **Relations** tab and connect them first.")
+
+    # 构建每个 agent 的可见集（邻居 ∩ 参与者）
+    visibility: dict[str, set[str]] = {}
+    topo_lines = []
+    for p in participants:
+        visible = _get_neighbors(p["id"]) & participant_ids
+        visibility[p["id"]] = visible
+        visible_names = [agents[vid]["name"] for vid in visible if vid in agents]
+        topo_lines.append(f"- **{p['name']}** hears: {', '.join(visible_names)}")
+    topo_header = "**Topology:**\n" + "\n".join(topo_lines) + "\n\n---\n\n"
+
     history: list[dict] = []
     # 第一个 agent 开场
     opener = participants[0]
     opening = topic.strip() if topic.strip() else "Hello! Let's have a conversation."
     history.append({"agent_id": opener["id"], "name": opener["name"], "content": opening})
-    yield format_log(history)
+    yield topo_header + format_log(history)
 
     # 从第二个 agent 开始，轮流发言
     n = len(participants)
     for turn in range(int(turns) - 1):
         speaker = participants[(turn + 1) % n]
-        reply = llm_reply(speaker, history)
+        reply = llm_reply(speaker, history, visible_ids=visibility[speaker["id"]])
         history.append({"agent_id": speaker["id"], "name": speaker["name"], "content": reply})
-        yield format_log(history)
+        yield topo_header + format_log(history)
 
     conv_id = str(uuid.uuid4())[:8]
     conversations[conv_id] = history
-    yield format_log(history) + "\n\n--- Conversation finished ---"
+    yield topo_header + format_log(history) + "\n\n--- Conversation finished ---"
 
 def format_log(history: list[dict]) -> str:
     lines = []
