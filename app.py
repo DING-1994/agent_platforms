@@ -363,9 +363,17 @@ with gr.Blocks(title="LLM Agent Platform") as app:
 
 if __name__ == "__main__":
     share = os.getenv("SHARE", "false").lower() in ("1", "true", "yes")
+    port = int(os.getenv("PORT", "7860"))
+
+    if share:
+        print("\n=== Starting with public link (SHARE=true) ===")
+        print("If the Gradio tunnel fails, you can also use:")
+        print("  ngrok http 7860")
+        print("  or: ssh -R 80:localhost:7860 serveo.net\n")
+
     app.launch(
         server_name="0.0.0.0",
-        server_port=int(os.getenv("PORT", "7860")),
+        server_port=port,
         share=share,
         show_error=True,
     )
