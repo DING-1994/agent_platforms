@@ -26,7 +26,7 @@ COLORS = [
 
 # ── LLM 调用 ───────────────────────────────────────────
 def llm_reply(agent: dict, history: list[dict]) -> str:
-    """调用 OpenAI 兼容 API 生成回复"""
+    """调用 OpenAI 兼容 API 生成回复（支持多 agent 上下文）"""
     api_key = os.getenv("OPENAI_API_KEY", "")
     base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
     if not api_key:
@@ -34,8 +34,11 @@ def llm_reply(agent: dict, history: list[dict]) -> str:
     client = OpenAI(api_key=api_key, base_url=base_url)
     messages = [{"role": "system", "content": agent["prompt"]}]
     for m in history:
-        role = "assistant" if m["agent_id"] == agent["id"] else "user"
-        messages.append({"role": role, "content": m["content"]})
+        if m["agent_id"] == agent["id"]:
+            messages.append({"role": "assistant", "content": m["content"]})
+        else:
+            # 多 agent 时用名字前缀区分不同发言者
+            messages.append({"role": "user", "content": f'[{m["name"]}]: {m["content"]}'})
     try:
         r = client.chat.completions.create(
             model=os.getenv("DEFAULT_MODEL", "gpt-3.5-turbo"),
@@ -107,7 +110,7 @@ def add_agent(name: str, role: str, prompt: str):
         agent_dropdown_choices(),
         agent_dropdown_choices(),
         agent_dropdown_choices(),
-        edge_dropdown_choices(),
+        agent_checkbox_choices(),
         gr.update(value=""),
         gr.update(value=""),
         gr.update(value=""),
@@ -124,7 +127,7 @@ def delete_agent(selection: str):
         agent_dropdown_choices(),
         agent_dropdown_choices(),
         agent_dropdown_choices(),
-        edge_dropdown_choices(),
+        agent_checkbox_choices(),
     )
 
 def _remove_edges_for(aid: str):
@@ -140,6 +143,9 @@ def _parse_id(s: str) -> str | None:
     return None
 
 def agent_dropdown_choices():
+    return gr.update(choices=[f'{a["name"]} ({a["id"]})' for a in agents.values()])
+
+def agent_checkbox_choices():
     return gr.update(choices=[f'{a["name"]} ({a["id"]})' for a in agents.values()])
 
 def edge_dropdown_choices():
@@ -174,34 +180,37 @@ def delete_edge(selection: str):
 
 
 # ── 对话 ───────────────────────────────────────────────
-def start_conversation(edge_sel: str, topic: str, turns: int):
-    eid = _parse_id(edge_sel)
-    if not eid:
-        return "Please select a relation first."
-    edge = next((e for e in edges if e["id"] == eid), None)
-    if not edge:
-        return "Relation not found."
-    a1 = agents.get(edge["source"])
-    a2 = agents.get(edge["target"])
-    if not a1 or not a2:
-        return "Agent(s) missing."
+def start_conversation(agent_selections: list[str], topic: str, turns: int):
+    """支持 N 个 agent 的群聊，按选中顺序轮流发言"""
+    if not agent_selections or len(agent_selections) < 2:
+        return "Please select at least 2 agents to start a conversation."
+
+    # 解析选中的 agent
+    participants = []
+    for sel in agent_selections:
+        aid = _parse_id(sel)
+        if aid and aid in agents:
+            participants.append(agents[aid])
+    if len(participants) < 2:
+        return "Need at least 2 valid agents."
 
     history: list[dict] = []
-    # Agent 1 开场
+    # 第一个 agent 开场
+    opener = participants[0]
     opening = topic.strip() if topic.strip() else "Hello! Let's have a conversation."
-    history.append({"agent_id": a1["id"], "name": a1["name"], "content": opening})
-    log = format_log(history)
-    yield log
+    history.append({"agent_id": opener["id"], "name": opener["name"], "content": opening})
+    yield format_log(history)
 
-    speaker, listener = a2, a1
+    # 从第二个 agent 开始，轮流发言
+    n = len(participants)
     for turn in range(int(turns) - 1):
+        speaker = participants[(turn + 1) % n]
         reply = llm_reply(speaker, history)
         history.append({"agent_id": speaker["id"], "name": speaker["name"], "content": reply})
-        log = format_log(history)
-        yield log
-        speaker, listener = listener, speaker
+        yield format_log(history)
 
-    conversations[eid] = history
+    conv_id = str(uuid.uuid4())[:8]
+    conversations[conv_id] = history
     yield format_log(history) + "\n\n--- Conversation finished ---"
 
 def format_log(history: list[dict]) -> str:
@@ -241,31 +250,28 @@ with gr.Blocks(title="LLM Agent Platform") as app:
                 del_btn = gr.Button("Delete Agent", variant="stop")
 
     gr.Markdown("---")
-    gr.Markdown("### 💬 Agent Conversation")
+    gr.Markdown("### 💬 Agent Conversation (Multi-Agent)")
     with gr.Row():
-        conv_edge = gr.Dropdown(label="Select Relation", choices=[])
-        conv_topic = gr.Textbox(label="Opening topic / first message", placeholder="Let's discuss AI ethics...")
-        conv_turns = gr.Slider(2, 20, value=6, step=1, label="Turns")
+        conv_agents = gr.CheckboxGroup(label="Select Agents (pick 2+)", choices=[])
+        with gr.Column():
+            conv_topic = gr.Textbox(label="Opening topic / first message", placeholder="Let's discuss AI ethics...")
+            conv_turns = gr.Slider(2, 20, value=6, step=1, label="Turns")
     conv_btn = gr.Button("▶ Start Conversation", variant="primary")
-    conv_log = gr.Markdown(value="*Select a relation and click Start...*")
+    conv_log = gr.Markdown(value="*Select 2 or more agents and click Start...*")
 
     # ── Events ─────────────────────────────────────────
     add_btn.click(
         add_agent, [a_name, a_role, a_prompt],
-        [canvas, src_dd, tgt_dd, del_dd, conv_edge, a_name, a_role, a_prompt],
+        [canvas, src_dd, tgt_dd, del_dd, conv_agents, a_name, a_role, a_prompt],
     )
     del_btn.click(
         delete_agent, [del_dd],
-        [canvas, src_dd, tgt_dd, del_dd, conv_edge],
+        [canvas, src_dd, tgt_dd, del_dd, conv_agents],
     )
     link_btn.click(add_edge, [src_dd, tgt_dd], [canvas, edge_dd])
     unlink_btn.click(delete_edge, [edge_dd], [canvas, edge_dd])
 
-    # sync edge_dd -> conv_edge
-    link_btn.click(lambda: edge_dropdown_choices(), [], [conv_edge])
-    unlink_btn.click(lambda: edge_dropdown_choices(), [], [conv_edge])
-
-    conv_btn.click(start_conversation, [conv_edge, conv_topic, conv_turns], [conv_log])
+    conv_btn.click(start_conversation, [conv_agents, conv_topic, conv_turns], [conv_log])
 
 
 if __name__ == "__main__":
