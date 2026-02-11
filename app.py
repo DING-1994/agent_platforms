@@ -3,7 +3,7 @@ LLM Agent Platform — 可视化拖拽创建 Agent，建立关系，进行对话
 Usage: python app.py
 """
 
-import json, os, uuid, io
+import json, os, uuid, io, threading
 import gradio as gr
 import matplotlib
 matplotlib.use("Agg")
@@ -12,12 +12,14 @@ import matplotlib.patches as mpatches
 import networkx as nx
 from openai import OpenAI
 
-# ── 状态 ────────────────────────────────────────────────
+# ── 共享状态（多用户并发访问，需要锁保护） ──────────────
 # agents  = { id: {id, name, role, prompt, color, x, y} }
 # edges   = [ {id, source, target} ]
+_lock = threading.Lock()
 agents: dict[str, dict] = {}
 edges: list[dict] = []
-conversations: dict[str, list] = {}   # edge_id -> [messages]
+conversations: dict[str, list] = {}   # conv_id -> [messages]
+_active_users: set[str] = set()       # 在线 session id
 
 COLORS = [
     "#e94560", "#3498db", "#2ecc71", "#9b59b6",
@@ -96,19 +98,19 @@ def render_canvas() -> plt.Figure:
 
 # ── Agent CRUD ─────────────────────────────────────────
 def add_agent(name: str, role: str, prompt: str):
-    if not name.strip():
-        name = f"Agent-{len(agents)+1}"
-    aid = str(uuid.uuid4())[:8]
-    # 自动排列位置
-    col = len(agents) % 4
-    row = len(agents) // 4
-    agents[aid] = {
-        "id": aid, "name": name.strip(),
-        "role": role.strip() or "Assistant",
-        "prompt": prompt.strip() or f"You are {name}, a helpful assistant.",
-        "color": COLORS[len(agents) % len(COLORS)],
-        "x": 120 + col * 180, "y": 400 - row * 150,
-    }
+    with _lock:
+        if not name.strip():
+            name = f"Agent-{len(agents)+1}"
+        aid = str(uuid.uuid4())[:8]
+        col = len(agents) % 4
+        row = len(agents) // 4
+        agents[aid] = {
+            "id": aid, "name": name.strip(),
+            "role": role.strip() or "Assistant",
+            "prompt": prompt.strip() or f"You are {name}, a helpful assistant.",
+            "color": COLORS[len(agents) % len(COLORS)],
+            "x": 120 + col * 180, "y": 400 - row * 150,
+        }
     return (
         render_canvas(),
         agent_dropdown_choices(),
@@ -121,11 +123,11 @@ def add_agent(name: str, role: str, prompt: str):
     )
 
 def delete_agent(selection: str):
-    aid = _parse_id(selection)
-    if aid and aid in agents:
-        del agents[aid]
-        # 删除相关连线
-        _remove_edges_for(aid)
+    with _lock:
+        aid = _parse_id(selection)
+        if aid and aid in agents:
+            del agents[aid]
+            _remove_edges_for(aid)
     return (
         render_canvas(),
         agent_dropdown_choices(),
@@ -173,23 +175,24 @@ def edge_dropdown_choices():
 
 # ── 关系(Edge) ─────────────────────────────────────────
 def add_edge(src_sel: str, tgt_sel: str):
-    src = _parse_id(src_sel)
-    tgt = _parse_id(tgt_sel)
-    if not src or not tgt or src == tgt:
-        return render_canvas(), edge_dropdown_choices()
-    # 避免重复
-    for e in edges:
-        if {e["source"], e["target"]} == {src, tgt}:
+    with _lock:
+        src = _parse_id(src_sel)
+        tgt = _parse_id(tgt_sel)
+        if not src or not tgt or src == tgt:
             return render_canvas(), edge_dropdown_choices()
-    eid = str(uuid.uuid4())[:8]
-    edges.append({"id": eid, "source": src, "target": tgt})
+        for e in edges:
+            if {e["source"], e["target"]} == {src, tgt}:
+                return render_canvas(), edge_dropdown_choices()
+        eid = str(uuid.uuid4())[:8]
+        edges.append({"id": eid, "source": src, "target": tgt})
     return render_canvas(), edge_dropdown_choices()
 
 def delete_edge(selection: str):
-    eid = _parse_id(selection)
-    if eid:
-        global edges
-        edges = [e for e in edges if e["id"] != eid]
+    with _lock:
+        eid = _parse_id(selection)
+        if eid:
+            global edges
+            edges = [e for e in edges if e["id"] != eid]
     return render_canvas(), edge_dropdown_choices()
 
 
@@ -257,9 +260,37 @@ def format_log(history: list[dict]) -> str:
     return "\n\n".join(lines)
 
 
+# ── 同步刷新 ───────────────────────────────────────────
+def _refresh_all():
+    """返回最新画布 + 所有下拉列表，供多人实时同步"""
+    return (
+        render_canvas(),
+        agent_dropdown_choices(),
+        agent_dropdown_choices(),
+        agent_dropdown_choices(),
+        agent_checkbox_choices(),
+        edge_dropdown_choices(),
+    )
+
+def _user_count_text() -> str:
+    n = len(_active_users)
+    return f"**{n}** user{'s' if n != 1 else ''} online"
+
+def _on_connect(request: gr.Request):
+    sid = str(id(request))
+    _active_users.add(sid)
+    return _user_count_text()
+
+def _on_disconnect(request: gr.Request):
+    sid = str(id(request))
+    _active_users.discard(sid)
+
+
 # ── Gradio UI ──────────────────────────────────────────
 with gr.Blocks(title="LLM Agent Platform") as app:
-    gr.Markdown("# 🤖 LLM Agent Platform\nCreate agents, connect them, and let them talk!")
+    gr.Markdown("# LLM Agent Platform\nCreate agents, connect them, and let them talk!\n\n"
+                "Share this link with others — everyone sees the same canvas in real time.")
+    status_bar = gr.Markdown(value=_user_count_text())
 
     with gr.Row():
         # ─ 左侧: 画布 ─
@@ -268,32 +299,34 @@ with gr.Blocks(title="LLM Agent Platform") as app:
 
         # ─ 右侧: 控制面板 ─
         with gr.Column(scale=2):
-            with gr.Tab("➕ Add Agent"):
+            with gr.Tab("Add Agent"):
                 a_name  = gr.Textbox(label="Name", placeholder="e.g. Socrates")
                 a_role  = gr.Textbox(label="Role", placeholder="e.g. Philosopher")
                 a_prompt = gr.Textbox(label="System Prompt", lines=3,
                            placeholder="You are Socrates, the Greek philosopher...")
                 add_btn = gr.Button("Add Agent", variant="primary")
 
-            with gr.Tab("🔗 Relations"):
+            with gr.Tab("Relations"):
                 src_dd = gr.Dropdown(label="Agent A", choices=[])
                 tgt_dd = gr.Dropdown(label="Agent B", choices=[])
                 link_btn = gr.Button("Connect", variant="primary")
                 edge_dd = gr.Dropdown(label="Existing Relations", choices=[])
                 unlink_btn = gr.Button("Delete Relation", variant="stop")
 
-            with gr.Tab("🗑️ Delete"):
+            with gr.Tab("Delete"):
                 del_dd = gr.Dropdown(label="Select Agent", choices=[])
                 del_btn = gr.Button("Delete Agent", variant="stop")
 
+            refresh_btn = gr.Button("Refresh Canvas", variant="secondary", size="sm")
+
     gr.Markdown("---")
-    gr.Markdown("### 💬 Agent Conversation (Multi-Agent)")
+    gr.Markdown("### Agent Conversation (Multi-Agent)")
     with gr.Row():
         conv_agents = gr.CheckboxGroup(label="Select Agents (pick 2+)", choices=[])
         with gr.Column():
             conv_topic = gr.Textbox(label="Opening topic / first message", placeholder="Let's discuss AI ethics...")
             conv_turns = gr.Slider(2, 20, value=6, step=1, label="Turns")
-    conv_btn = gr.Button("▶ Start Conversation", variant="primary")
+    conv_btn = gr.Button("Start Conversation", variant="primary")
     conv_log = gr.Markdown(value="*Select 2 or more agents and click Start...*")
 
     # ── Events ─────────────────────────────────────────
@@ -310,7 +343,37 @@ with gr.Blocks(title="LLM Agent Platform") as app:
 
     conv_btn.click(start_conversation, [conv_agents, conv_topic, conv_turns], [conv_log])
 
+    # 手动刷新：拉取其他用户的最新更改
+    refresh_btn.click(
+        _refresh_all, [],
+        [canvas, src_dd, tgt_dd, del_dd, conv_agents, edge_dd],
+    )
+
+    # 自动定时刷新画布（每 5 秒），让多人协作保持同步
+    _timer = gr.Timer(value=5)
+    _timer.tick(
+        _refresh_all, [],
+        [canvas, src_dd, tgt_dd, del_dd, conv_agents, edge_dd],
+    )
+
+    # 用户连接/断开时更新在线人数
+    app.load(_on_connect, [], [status_bar])
+    app.unload(_on_disconnect)
+
 
 if __name__ == "__main__":
-    app.launch(server_name="0.0.0.0", server_port=7860,
-                theme=gr.themes.Soft(primary_hue="indigo", secondary_hue="purple"))
+    share = os.getenv("SHARE", "false").lower() in ("1", "true", "yes")
+    port = int(os.getenv("PORT", "7860"))
+
+    if share:
+        print("\n=== Starting with public link (SHARE=true) ===")
+        print("If the Gradio tunnel fails, you can also use:")
+        print("  ngrok http 7860")
+        print("  or: ssh -R 80:localhost:7860 serveo.net\n")
+
+    app.launch(
+        server_name="0.0.0.0",
+        server_port=port,
+        share=share,
+        show_error=True,
+    )
