@@ -16,5 +16,7 @@ EXPOSE 7860
 
 # Docker 内默认开启公开链接
 ENV SHARE=true
+# 关闭 Python stdout 缓冲，让 print 立即输出到 docker logs
+ENV PYTHONUNBUFFERED=1
 
 CMD ["python", "app.py"]
