@@ -3,12 +3,13 @@ LLM Agent Platform — 可视化拖拽创建 Agent，建立关系，进行对话
 Usage: python app.py
 """
 
-import json, os, uuid, io, threading
+import json, os, uuid, io, threading, textwrap, tempfile
 import gradio as gr
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+from matplotlib.patches import FancyBboxPatch
 import networkx as nx
 from openai import OpenAI
 
@@ -26,78 +27,114 @@ COLORS = [
     "#f39c12", "#1abc9c", "#e67e22", "#00cec9",
 ]
 
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "gpt-3.5-turbo")
+
 # ── LLM 调用 ───────────────────────────────────────────
 def llm_reply(agent: dict, history: list[dict], visible_ids: set[str] | None = None) -> str:
     """调用 OpenAI 兼容 API 生成回复。
+    每个 agent 可指定自己的 model（含 fine-tuned），未指定则用全局 DEFAULT_MODEL。
     visible_ids: 该 agent 能"听到"的其他 agent id 集合（基于连线拓扑）。
-    为 None 时表示能听到所有人（向后兼容）。
     """
     api_key = os.getenv("OPENAI_API_KEY", "")
     base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
     if not api_key:
-        return f"[请设置环境变量 OPENAI_API_KEY]"
+        return "[请设置环境变量 OPENAI_API_KEY]"
     client = OpenAI(api_key=api_key, base_url=base_url)
+    model = agent.get("model") or DEFAULT_MODEL
     messages = [{"role": "system", "content": agent["prompt"]}]
     for m in history:
         if m["agent_id"] == agent["id"]:
             messages.append({"role": "assistant", "content": m["content"]})
         elif visible_ids is None or m["agent_id"] in visible_ids:
-            # 只接收能"听到"的 agent 的消息
             messages.append({"role": "user", "content": f'[{m["name"]}]: {m["content"]}'})
-        # else: 没有连线 → 这条消息对当前 agent 不可见
     try:
         r = client.chat.completions.create(
-            model=os.getenv("DEFAULT_MODEL", "gpt-3.5-turbo"),
+            model=model,
             messages=messages, max_tokens=512, temperature=0.8,
         )
         return r.choices[0].message.content or "(empty)"
     except Exception as e:
-        return f"[LLM Error: {e}]"
+        return f"[LLM Error ({model}): {e}]"
 
 
 # ── 画布渲染 ───────────────────────────────────────────
-def render_canvas() -> plt.Figure:
-    """用 matplotlib 绘制 agent 节点和关系连线"""
-    fig, ax = plt.subplots(figsize=(8, 5))
-    fig.patch.set_facecolor("#1a1a2e")
-    ax.set_facecolor("#1a1a2e")
+def render_canvas(bubbles: dict[str, str] | None = None,
+                  speaking_id: str | None = None) -> str:
+    """用 matplotlib 绘制 agent 节点、连线和对话气泡，返回高清 PNG 路径。
+    bubbles:     {agent_id: 最新发言文本}  — 只显示 speaking_id 的气泡
+    speaking_id: 当前正在说话的 agent id — 高亮其边框并显示气泡
+    """
+    fig, ax = plt.subplots(figsize=(10, 7), dpi=200)
+    fig.patch.set_facecolor("#ffffff")
+    ax.set_facecolor("#ffffff")
     ax.set_xlim(0, 800)
-    ax.set_ylim(0, 500)
+    ax.set_ylim(-60, 540)
     ax.set_aspect("equal")
     ax.axis("off")
 
     if not agents:
         ax.text(400, 250, "No agents yet.\nClick 'Add Agent' to start!",
                 ha="center", va="center", fontsize=14, color="#888")
-        return fig
+    else:
+        pos = {}
+        for a in agents.values():
+            pos[a["id"]] = (a["x"], a["y"])
 
-    pos = {}
-    for a in agents.values():
-        pos[a["id"]] = (a["x"], a["y"])
+        # 画连线
+        for e in edges:
+            if e["source"] in pos and e["target"] in pos:
+                x0, y0 = pos[e["source"]]
+                x1, y1 = pos[e["target"]]
+                ax.annotate("", xy=(x1, y1), xytext=(x0, y0),
+                            arrowprops=dict(arrowstyle="<->", color="#bbb", lw=2))
 
-    # 画连线
-    for e in edges:
-        if e["source"] in pos and e["target"] in pos:
-            x0, y0 = pos[e["source"]]
-            x1, y1 = pos[e["target"]]
-            ax.annotate("", xy=(x1, y1), xytext=(x0, y0),
-                        arrowprops=dict(arrowstyle="<->", color="#555", lw=2))
+        # 画节点
+        for a in agents.values():
+            is_speaking = (speaking_id == a["id"])
+            ec = "#ffd700" if is_speaking else "#666"
+            lw = 3.5 if is_speaking else 2
+            circle = plt.Circle((a["x"], a["y"]), 38,
+                                 color=a["color"], ec=ec, lw=lw, zorder=5)
+            ax.add_patch(circle)
+            ax.text(a["x"], a["y"] + 8, a["name"], ha="center", va="center",
+                    fontsize=9, fontweight="bold", color="white", zorder=6)
+            ax.text(a["x"], a["y"] - 6, a["role"], ha="center", va="center",
+                    fontsize=7, color="#eee", zorder=6)
+            m_label = a.get("model") or DEFAULT_MODEL
+            if len(m_label) > 16:
+                m_label = m_label[:14] + ".."
+            ax.text(a["x"], a["y"] - 18, m_label, ha="center", va="center",
+                    fontsize=5, color="#ddd", zorder=6)
 
-    # 画节点
-    for a in agents.values():
-        circle = plt.Circle((a["x"], a["y"]), 38, color=a["color"], ec="white", lw=2, zorder=5)
-        ax.add_patch(circle)
-        ax.text(a["x"], a["y"] + 2, a["name"], ha="center", va="center",
-                fontsize=9, fontweight="bold", color="white", zorder=6)
-        ax.text(a["x"], a["y"] - 14, a["role"], ha="center", va="center",
-                fontsize=7, color="#ccc", zorder=6)
+        # 只画当前发言者的气泡
+        if bubbles and speaking_id and speaking_id in bubbles and speaking_id in pos:
+            aid = speaking_id
+            text = bubbles[aid]
+            bx, by = pos[aid]
+            short = text[:120] + ("..." if len(text) > 120 else "")
+            wrapped = textwrap.fill(short, width=22)
+            bubble_y = by + 58
+            ax.text(bx, bubble_y, wrapped, ha="center", va="bottom",
+                    fontsize=6, color="#222", zorder=10,
+                    bbox=dict(boxstyle="round,pad=0.4",
+                              fc=agents[aid]["color"] + "22",
+                              ec=agents[aid]["color"], lw=1.2))
 
     plt.tight_layout()
-    return fig
+    # 导出高清 PNG
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=200, bbox_inches="tight",
+                facecolor=fig.get_facecolor(), edgecolor="none")
+    plt.close(fig)
+    buf.seek(0)
+    tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+    tmp.write(buf.read())
+    tmp.close()
+    return tmp.name
 
 
 # ── Agent CRUD ─────────────────────────────────────────
-def add_agent(name: str, role: str, prompt: str):
+def add_agent(name: str, role: str, prompt: str, model: str):
     with _lock:
         if not name.strip():
             name = f"Agent-{len(agents)+1}"
@@ -108,6 +145,7 @@ def add_agent(name: str, role: str, prompt: str):
             "id": aid, "name": name.strip(),
             "role": role.strip() or "Assistant",
             "prompt": prompt.strip() or f"You are {name}, a helpful assistant.",
+            "model": model.strip() or "",
             "color": COLORS[len(agents) % len(COLORS)],
             "x": 120 + col * 180, "y": 400 - row * 150,
         }
@@ -117,6 +155,7 @@ def add_agent(name: str, role: str, prompt: str):
         agent_dropdown_choices(),
         agent_dropdown_choices(),
         agent_checkbox_choices(),
+        gr.update(value=""),
         gr.update(value=""),
         gr.update(value=""),
         gr.update(value=""),
@@ -197,10 +236,20 @@ def delete_edge(selection: str):
 
 
 # ── 对话 ───────────────────────────────────────────────
+def _build_bubbles(history: list[dict]) -> dict[str, str]:
+    """从 history 中提取每个 agent 的最新发言"""
+    latest: dict[str, str] = {}
+    for m in history:
+        latest[m["agent_id"]] = m["content"]
+    return latest
+
 def start_conversation(agent_selections: list[str], topic: str, turns: int):
-    """支持 N 个 agent 的群聊，按连线拓扑决定每个 agent 能听到谁"""
+    """支持 N 个 agent 的群聊，按连线拓扑决定每个 agent 能听到谁。
+    每轮同时 yield (画布, 文本日志) 让气泡实时显示在节点旁。
+    """
     if not agent_selections or len(agent_selections) < 2:
-        return "Please select at least 2 agents to start a conversation."
+        yield render_canvas(), "Please select at least 2 agents to start a conversation."
+        return
 
     # 解析选中的 agent
     participants = []
@@ -209,20 +258,23 @@ def start_conversation(agent_selections: list[str], topic: str, turns: int):
         if aid and aid in agents:
             participants.append(agents[aid])
     if len(participants) < 2:
-        return "Need at least 2 valid agents."
+        yield render_canvas(), "Need at least 2 valid agents."
+        return
 
     participant_ids = {p["id"] for p in participants}
 
-    # 检查连通性：找出没有任何连线（在参与者中）的 agent
+    # 检查连通性
     isolated = []
     for p in participants:
         neighbors = _get_neighbors(p["id"]) & participant_ids
         if not neighbors:
             isolated.append(p["name"])
     if isolated:
-        return (f"**Cannot start**: {', '.join(isolated)} ha{'s' if len(isolated)==1 else 've'} "
-                f"no connections to other selected agents.\n\n"
-                f"Please go to **Relations** tab and connect them first.")
+        msg = (f"**Cannot start**: {', '.join(isolated)} ha{'s' if len(isolated)==1 else 've'} "
+               f"no connections to other selected agents.\n\n"
+               f"Please go to **Relations** tab and connect them first.")
+        yield render_canvas(), msg
+        return
 
     # 构建每个 agent 的可见集（邻居 ∩ 参与者）
     visibility: dict[str, set[str]] = {}
@@ -239,7 +291,8 @@ def start_conversation(agent_selections: list[str], topic: str, turns: int):
     opener = participants[0]
     opening = topic.strip() if topic.strip() else "Hello! Let's have a conversation."
     history.append({"agent_id": opener["id"], "name": opener["name"], "content": opening})
-    yield topo_header + format_log(history)
+    yield (render_canvas(_build_bubbles(history), opener["id"]),
+           topo_header + format_log(history))
 
     # 从第二个 agent 开始，轮流发言
     n = len(participants)
@@ -247,11 +300,14 @@ def start_conversation(agent_selections: list[str], topic: str, turns: int):
         speaker = participants[(turn + 1) % n]
         reply = llm_reply(speaker, history, visible_ids=visibility[speaker["id"]])
         history.append({"agent_id": speaker["id"], "name": speaker["name"], "content": reply})
-        yield topo_header + format_log(history)
+        yield (render_canvas(_build_bubbles(history), speaker["id"]),
+               topo_header + format_log(history))
 
     conv_id = str(uuid.uuid4())[:8]
     conversations[conv_id] = history
-    yield topo_header + format_log(history) + "\n\n--- Conversation finished ---"
+    # 最终帧：无高亮
+    yield (render_canvas(_build_bubbles(history)),
+           topo_header + format_log(history) + "\n\n--- Conversation finished ---")
 
 def format_log(history: list[dict]) -> str:
     lines = []
@@ -295,7 +351,7 @@ with gr.Blocks(title="LLM Agent Platform") as app:
     with gr.Row():
         # ─ 左侧: 画布 ─
         with gr.Column(scale=3):
-            canvas = gr.Plot(value=render_canvas, label="Agent Canvas")
+            canvas = gr.Image(value=render_canvas, label="Agent Canvas", type="filepath")
 
         # ─ 右侧: 控制面板 ─
         with gr.Column(scale=2):
@@ -304,6 +360,8 @@ with gr.Blocks(title="LLM Agent Platform") as app:
                 a_role  = gr.Textbox(label="Role", placeholder="e.g. Philosopher")
                 a_prompt = gr.Textbox(label="System Prompt", lines=3,
                            placeholder="You are Socrates, the Greek philosopher...")
+                a_model = gr.Textbox(label="Model (optional)",
+                           placeholder="e.g. gpt-4o, ft:gpt-4o-mini-2024-07-18:my-org:xxx")
                 add_btn = gr.Button("Add Agent", variant="primary")
 
             with gr.Tab("Relations"):
@@ -331,8 +389,8 @@ with gr.Blocks(title="LLM Agent Platform") as app:
 
     # ── Events ─────────────────────────────────────────
     add_btn.click(
-        add_agent, [a_name, a_role, a_prompt],
-        [canvas, src_dd, tgt_dd, del_dd, conv_agents, a_name, a_role, a_prompt],
+        add_agent, [a_name, a_role, a_prompt, a_model],
+        [canvas, src_dd, tgt_dd, del_dd, conv_agents, a_name, a_role, a_prompt, a_model],
     )
     del_btn.click(
         delete_agent, [del_dd],
@@ -341,7 +399,7 @@ with gr.Blocks(title="LLM Agent Platform") as app:
     link_btn.click(add_edge, [src_dd, tgt_dd], [canvas, edge_dd])
     unlink_btn.click(delete_edge, [edge_dd], [canvas, edge_dd])
 
-    conv_btn.click(start_conversation, [conv_agents, conv_topic, conv_turns], [conv_log])
+    conv_btn.click(start_conversation, [conv_agents, conv_topic, conv_turns], [canvas, conv_log])
 
     # 手动刷新：拉取其他用户的最新更改
     refresh_btn.click(
