@@ -26,33 +26,34 @@ COLORS = [
     "#f39c12", "#1abc9c", "#e67e22", "#00cec9",
 ]
 
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "gpt-3.5-turbo")
+
 # ── LLM 调用 ───────────────────────────────────────────
 def llm_reply(agent: dict, history: list[dict], visible_ids: set[str] | None = None) -> str:
     """调用 OpenAI 兼容 API 生成回复。
+    每个 agent 可指定自己的 model（含 fine-tuned），未指定则用全局 DEFAULT_MODEL。
     visible_ids: 该 agent 能"听到"的其他 agent id 集合（基于连线拓扑）。
-    为 None 时表示能听到所有人（向后兼容）。
     """
     api_key = os.getenv("OPENAI_API_KEY", "")
     base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
     if not api_key:
-        return f"[请设置环境变量 OPENAI_API_KEY]"
+        return "[请设置环境变量 OPENAI_API_KEY]"
     client = OpenAI(api_key=api_key, base_url=base_url)
+    model = agent.get("model") or DEFAULT_MODEL
     messages = [{"role": "system", "content": agent["prompt"]}]
     for m in history:
         if m["agent_id"] == agent["id"]:
             messages.append({"role": "assistant", "content": m["content"]})
         elif visible_ids is None or m["agent_id"] in visible_ids:
-            # 只接收能"听到"的 agent 的消息
             messages.append({"role": "user", "content": f'[{m["name"]}]: {m["content"]}'})
-        # else: 没有连线 → 这条消息对当前 agent 不可见
     try:
         r = client.chat.completions.create(
-            model=os.getenv("DEFAULT_MODEL", "gpt-3.5-turbo"),
+            model=model,
             messages=messages, max_tokens=512, temperature=0.8,
         )
         return r.choices[0].message.content or "(empty)"
     except Exception as e:
-        return f"[LLM Error: {e}]"
+        return f"[LLM Error ({model}): {e}]"
 
 
 # ── 画布渲染 ───────────────────────────────────────────
@@ -87,17 +88,23 @@ def render_canvas() -> plt.Figure:
     for a in agents.values():
         circle = plt.Circle((a["x"], a["y"]), 38, color=a["color"], ec="white", lw=2, zorder=5)
         ax.add_patch(circle)
-        ax.text(a["x"], a["y"] + 2, a["name"], ha="center", va="center",
+        ax.text(a["x"], a["y"] + 8, a["name"], ha="center", va="center",
                 fontsize=9, fontweight="bold", color="white", zorder=6)
-        ax.text(a["x"], a["y"] - 14, a["role"], ha="center", va="center",
+        ax.text(a["x"], a["y"] - 6, a["role"], ha="center", va="center",
                 fontsize=7, color="#ccc", zorder=6)
+        # 显示 model 标签（截短）
+        m_label = a.get("model") or DEFAULT_MODEL
+        if len(m_label) > 16:
+            m_label = m_label[:14] + ".."
+        ax.text(a["x"], a["y"] - 18, m_label, ha="center", va="center",
+                fontsize=5, color="#999", zorder=6)
 
     plt.tight_layout()
     return fig
 
 
 # ── Agent CRUD ─────────────────────────────────────────
-def add_agent(name: str, role: str, prompt: str):
+def add_agent(name: str, role: str, prompt: str, model: str):
     with _lock:
         if not name.strip():
             name = f"Agent-{len(agents)+1}"
@@ -108,6 +115,7 @@ def add_agent(name: str, role: str, prompt: str):
             "id": aid, "name": name.strip(),
             "role": role.strip() or "Assistant",
             "prompt": prompt.strip() or f"You are {name}, a helpful assistant.",
+            "model": model.strip() or "",
             "color": COLORS[len(agents) % len(COLORS)],
             "x": 120 + col * 180, "y": 400 - row * 150,
         }
@@ -117,6 +125,7 @@ def add_agent(name: str, role: str, prompt: str):
         agent_dropdown_choices(),
         agent_dropdown_choices(),
         agent_checkbox_choices(),
+        gr.update(value=""),
         gr.update(value=""),
         gr.update(value=""),
         gr.update(value=""),
@@ -304,6 +313,8 @@ with gr.Blocks(title="LLM Agent Platform") as app:
                 a_role  = gr.Textbox(label="Role", placeholder="e.g. Philosopher")
                 a_prompt = gr.Textbox(label="System Prompt", lines=3,
                            placeholder="You are Socrates, the Greek philosopher...")
+                a_model = gr.Textbox(label="Model (optional)",
+                           placeholder="e.g. gpt-4o, ft:gpt-4o-mini-2024-07-18:my-org:xxx")
                 add_btn = gr.Button("Add Agent", variant="primary")
 
             with gr.Tab("Relations"):
@@ -331,8 +342,8 @@ with gr.Blocks(title="LLM Agent Platform") as app:
 
     # ── Events ─────────────────────────────────────────
     add_btn.click(
-        add_agent, [a_name, a_role, a_prompt],
-        [canvas, src_dd, tgt_dd, del_dd, conv_agents, a_name, a_role, a_prompt],
+        add_agent, [a_name, a_role, a_prompt, a_model],
+        [canvas, src_dd, tgt_dd, del_dd, conv_agents, a_name, a_role, a_prompt, a_model],
     )
     del_btn.click(
         delete_agent, [del_dd],
