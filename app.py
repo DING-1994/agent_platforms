@@ -3,7 +3,7 @@ LLM Agent Platform — 可视化拖拽创建 Agent，建立关系，进行对话
 Usage: python app.py
 """
 
-import json, os, uuid, io, threading, textwrap
+import json, os, uuid, io, threading, textwrap, tempfile
 import gradio as gr
 import matplotlib
 matplotlib.use("Agg")
@@ -59,12 +59,12 @@ def llm_reply(agent: dict, history: list[dict], visible_ids: set[str] | None = N
 
 # ── 画布渲染 ───────────────────────────────────────────
 def render_canvas(bubbles: dict[str, str] | None = None,
-                  speaking_id: str | None = None) -> plt.Figure:
-    """用 matplotlib 绘制 agent 节点、连线和对话气泡。
+                  speaking_id: str | None = None) -> str:
+    """用 matplotlib 绘制 agent 节点、连线和对话气泡，返回高清 PNG 路径。
     bubbles:     {agent_id: 最新发言文本}  — 只显示 speaking_id 的气泡
     speaking_id: 当前正在说话的 agent id — 高亮其边框并显示气泡
     """
-    fig, ax = plt.subplots(figsize=(8, 6))
+    fig, ax = plt.subplots(figsize=(10, 7), dpi=200)
     fig.patch.set_facecolor("#ffffff")
     ax.set_facecolor("#ffffff")
     ax.set_xlim(0, 800)
@@ -75,54 +75,62 @@ def render_canvas(bubbles: dict[str, str] | None = None,
     if not agents:
         ax.text(400, 250, "No agents yet.\nClick 'Add Agent' to start!",
                 ha="center", va="center", fontsize=14, color="#888")
-        return fig
+    else:
+        pos = {}
+        for a in agents.values():
+            pos[a["id"]] = (a["x"], a["y"])
 
-    pos = {}
-    for a in agents.values():
-        pos[a["id"]] = (a["x"], a["y"])
+        # 画连线
+        for e in edges:
+            if e["source"] in pos and e["target"] in pos:
+                x0, y0 = pos[e["source"]]
+                x1, y1 = pos[e["target"]]
+                ax.annotate("", xy=(x1, y1), xytext=(x0, y0),
+                            arrowprops=dict(arrowstyle="<->", color="#bbb", lw=2))
 
-    # 画连线
-    for e in edges:
-        if e["source"] in pos and e["target"] in pos:
-            x0, y0 = pos[e["source"]]
-            x1, y1 = pos[e["target"]]
-            ax.annotate("", xy=(x1, y1), xytext=(x0, y0),
-                        arrowprops=dict(arrowstyle="<->", color="#bbb", lw=2))
+        # 画节点
+        for a in agents.values():
+            is_speaking = (speaking_id == a["id"])
+            ec = "#ffd700" if is_speaking else "#666"
+            lw = 3.5 if is_speaking else 2
+            circle = plt.Circle((a["x"], a["y"]), 38,
+                                 color=a["color"], ec=ec, lw=lw, zorder=5)
+            ax.add_patch(circle)
+            ax.text(a["x"], a["y"] + 8, a["name"], ha="center", va="center",
+                    fontsize=9, fontweight="bold", color="white", zorder=6)
+            ax.text(a["x"], a["y"] - 6, a["role"], ha="center", va="center",
+                    fontsize=7, color="#eee", zorder=6)
+            m_label = a.get("model") or DEFAULT_MODEL
+            if len(m_label) > 16:
+                m_label = m_label[:14] + ".."
+            ax.text(a["x"], a["y"] - 18, m_label, ha="center", va="center",
+                    fontsize=5, color="#ddd", zorder=6)
 
-    # 画节点
-    for a in agents.values():
-        is_speaking = (speaking_id == a["id"])
-        ec = "#ffd700" if is_speaking else "#666"
-        lw = 3.5 if is_speaking else 2
-        circle = plt.Circle((a["x"], a["y"]), 38,
-                             color=a["color"], ec=ec, lw=lw, zorder=5)
-        ax.add_patch(circle)
-        ax.text(a["x"], a["y"] + 8, a["name"], ha="center", va="center",
-                fontsize=9, fontweight="bold", color="white", zorder=6)
-        ax.text(a["x"], a["y"] - 6, a["role"], ha="center", va="center",
-                fontsize=7, color="#eee", zorder=6)
-        m_label = a.get("model") or DEFAULT_MODEL
-        if len(m_label) > 16:
-            m_label = m_label[:14] + ".."
-        ax.text(a["x"], a["y"] - 18, m_label, ha="center", va="center",
-                fontsize=5, color="#ddd", zorder=6)
-
-    # 只画当前发言者的气泡
-    if bubbles and speaking_id and speaking_id in bubbles and speaking_id in pos:
-        aid = speaking_id
-        text = bubbles[aid]
-        bx, by = pos[aid]
-        short = text[:120] + ("..." if len(text) > 120 else "")
-        wrapped = textwrap.fill(short, width=22)
-        bubble_y = by + 58
-        ax.text(bx, bubble_y, wrapped, ha="center", va="bottom",
-                fontsize=6, color="#222", zorder=10,
-                bbox=dict(boxstyle="round,pad=0.4",
-                          fc=agents[aid]["color"] + "22",
-                          ec=agents[aid]["color"], lw=1.2))
+        # 只画当前发言者的气泡
+        if bubbles and speaking_id and speaking_id in bubbles and speaking_id in pos:
+            aid = speaking_id
+            text = bubbles[aid]
+            bx, by = pos[aid]
+            short = text[:120] + ("..." if len(text) > 120 else "")
+            wrapped = textwrap.fill(short, width=22)
+            bubble_y = by + 58
+            ax.text(bx, bubble_y, wrapped, ha="center", va="bottom",
+                    fontsize=6, color="#222", zorder=10,
+                    bbox=dict(boxstyle="round,pad=0.4",
+                              fc=agents[aid]["color"] + "22",
+                              ec=agents[aid]["color"], lw=1.2))
 
     plt.tight_layout()
-    return fig
+    # 导出高清 PNG
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=200, bbox_inches="tight",
+                facecolor=fig.get_facecolor(), edgecolor="none")
+    plt.close(fig)
+    buf.seek(0)
+    tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+    tmp.write(buf.read())
+    tmp.close()
+    return tmp.name
 
 
 # ── Agent CRUD ─────────────────────────────────────────
@@ -343,7 +351,7 @@ with gr.Blocks(title="LLM Agent Platform") as app:
     with gr.Row():
         # ─ 左侧: 画布 ─
         with gr.Column(scale=3):
-            canvas = gr.Plot(value=render_canvas, label="Agent Canvas")
+            canvas = gr.Image(value=render_canvas, label="Agent Canvas", type="filepath")
 
         # ─ 右侧: 控制面板 ─
         with gr.Column(scale=2):
