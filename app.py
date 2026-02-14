@@ -235,6 +235,71 @@ def delete_edge(selection: str):
     return render_canvas(), edge_dropdown_choices()
 
 
+# ── 配置 保存/加载 ─────────────────────────────────
+def save_config() -> str:
+    """将当前 agents 和 edges 导出为 JSON 文件，返回临时文件路径供下载。"""
+    with _lock:
+        data = {"agents": list(agents.values()), "edges": edges}
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".json", prefix="agent_config_", delete=False
+    )
+    json.dump(data, tmp, ensure_ascii=False, indent=2)
+    tmp.close()
+    return tmp.name
+
+
+def load_config(file):
+    """从上传的 JSON 文件加载 agents 和 edges，替换当前配置。"""
+    global edges
+    if file is None:
+        return (
+            render_canvas(),
+            agent_dropdown_choices(),
+            agent_dropdown_choices(),
+            agent_dropdown_choices(),
+            agent_checkbox_choices(),
+            edge_dropdown_choices(),
+            gr.update(value=None),
+            "⚠ 未选择文件",
+        )
+    try:
+        with open(file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        return (
+            render_canvas(),
+            agent_dropdown_choices(),
+            agent_dropdown_choices(),
+            agent_dropdown_choices(),
+            agent_checkbox_choices(),
+            edge_dropdown_choices(),
+            gr.update(value=None),
+            f"⚠ 读取失败: {e}",
+        )
+
+    with _lock:
+        agents.clear()
+        edges = []
+        for a in data.get("agents", []):
+            if "id" not in a:
+                continue
+            agents[a["id"]] = a
+        edges = data.get("edges", [])
+
+    n_agents = len(agents)
+    n_edges = len(edges)
+    return (
+        render_canvas(),
+        agent_dropdown_choices(),
+        agent_dropdown_choices(),
+        agent_dropdown_choices(),
+        agent_checkbox_choices(),
+        edge_dropdown_choices(),
+        gr.update(value=None),
+        f"✓ 加载成功: {n_agents} 个 agent, {n_edges} 条关系",
+    )
+
+
 # ── 对话 ───────────────────────────────────────────────
 def _build_bubbles(history: list[dict]) -> dict[str, str]:
     """从 history 中提取每个 agent 的最新发言"""
@@ -375,6 +440,14 @@ with gr.Blocks(title="LLM Agent Platform") as app:
                 del_dd = gr.Dropdown(label="Select Agent", choices=[])
                 del_btn = gr.Button("Delete Agent", variant="stop")
 
+            with gr.Tab("Save / Load"):
+                save_btn = gr.Button("Save Config (JSON)", variant="primary")
+                save_file = gr.File(label="Download", interactive=False)
+                gr.Markdown("---")
+                load_file = gr.File(label="Upload JSON Config", file_types=[".json"])
+                load_btn = gr.Button("Load Config", variant="secondary")
+                load_status = gr.Markdown("")
+
             refresh_btn = gr.Button("Refresh Canvas", variant="secondary", size="sm")
 
     gr.Markdown("---")
@@ -398,6 +471,12 @@ with gr.Blocks(title="LLM Agent Platform") as app:
     )
     link_btn.click(add_edge, [src_dd, tgt_dd], [canvas, edge_dd])
     unlink_btn.click(delete_edge, [edge_dd], [canvas, edge_dd])
+
+    save_btn.click(save_config, [], [save_file])
+    load_btn.click(
+        load_config, [load_file],
+        [canvas, src_dd, tgt_dd, del_dd, conv_agents, edge_dd, load_file, load_status],
+    )
 
     conv_btn.click(start_conversation, [conv_agents, conv_topic, conv_turns], [canvas, conv_log])
 
