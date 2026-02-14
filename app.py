@@ -61,12 +61,12 @@ def llm_reply(agent: dict, history: list[dict], visible_ids: set[str] | None = N
 def render_canvas(bubbles: dict[str, str] | None = None,
                   speaking_id: str | None = None) -> plt.Figure:
     """用 matplotlib 绘制 agent 节点、连线和对话气泡。
-    bubbles:     {agent_id: 最新发言文本}  — 显示在节点旁
-    speaking_id: 当前正在说话的 agent id — 高亮其边框
+    bubbles:     {agent_id: 最新发言文本}  — 只显示 speaking_id 的气泡
+    speaking_id: 当前正在说话的 agent id — 高亮其边框并显示气泡
     """
     fig, ax = plt.subplots(figsize=(8, 6))
-    fig.patch.set_facecolor("#1a1a2e")
-    ax.set_facecolor("#1a1a2e")
+    fig.patch.set_facecolor("#ffffff")
+    ax.set_facecolor("#ffffff")
     ax.set_xlim(0, 800)
     ax.set_ylim(-60, 540)
     ax.set_aspect("equal")
@@ -87,12 +87,12 @@ def render_canvas(bubbles: dict[str, str] | None = None,
             x0, y0 = pos[e["source"]]
             x1, y1 = pos[e["target"]]
             ax.annotate("", xy=(x1, y1), xytext=(x0, y0),
-                        arrowprops=dict(arrowstyle="<->", color="#555", lw=2))
+                        arrowprops=dict(arrowstyle="<->", color="#bbb", lw=2))
 
     # 画节点
     for a in agents.values():
         is_speaking = (speaking_id == a["id"])
-        ec = "#ffd700" if is_speaking else "white"
+        ec = "#ffd700" if is_speaking else "#666"
         lw = 3.5 if is_speaking else 2
         circle = plt.Circle((a["x"], a["y"]), 38,
                              color=a["color"], ec=ec, lw=lw, zorder=5)
@@ -100,29 +100,26 @@ def render_canvas(bubbles: dict[str, str] | None = None,
         ax.text(a["x"], a["y"] + 8, a["name"], ha="center", va="center",
                 fontsize=9, fontweight="bold", color="white", zorder=6)
         ax.text(a["x"], a["y"] - 6, a["role"], ha="center", va="center",
-                fontsize=7, color="#ccc", zorder=6)
+                fontsize=7, color="#eee", zorder=6)
         m_label = a.get("model") or DEFAULT_MODEL
         if len(m_label) > 16:
             m_label = m_label[:14] + ".."
         ax.text(a["x"], a["y"] - 18, m_label, ha="center", va="center",
-                fontsize=5, color="#999", zorder=6)
+                fontsize=5, color="#ddd", zorder=6)
 
-    # 画对话气泡
-    if bubbles:
-        for aid, text in bubbles.items():
-            if aid not in pos:
-                continue
-            bx, by = pos[aid]
-            # 截短 + 自动换行
-            short = text[:120] + ("..." if len(text) > 120 else "")
-            wrapped = textwrap.fill(short, width=22)
-            # 气泡位置：节点上方
-            bubble_y = by + 58
-            ax.text(bx, bubble_y, wrapped, ha="center", va="bottom",
-                    fontsize=6, color="#222", zorder=10,
-                    bbox=dict(boxstyle="round,pad=0.4",
-                              fc=agents[aid]["color"] + "33",
-                              ec=agents[aid]["color"], lw=1.2))
+    # 只画当前发言者的气泡
+    if bubbles and speaking_id and speaking_id in bubbles and speaking_id in pos:
+        aid = speaking_id
+        text = bubbles[aid]
+        bx, by = pos[aid]
+        short = text[:120] + ("..." if len(text) > 120 else "")
+        wrapped = textwrap.fill(short, width=22)
+        bubble_y = by + 58
+        ax.text(bx, bubble_y, wrapped, ha="center", va="bottom",
+                fontsize=6, color="#222", zorder=10,
+                bbox=dict(boxstyle="round,pad=0.4",
+                          fc=agents[aid]["color"] + "22",
+                          ec=agents[aid]["color"], lw=1.2))
 
     plt.tight_layout()
     return fig
