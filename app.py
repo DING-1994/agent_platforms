@@ -13,14 +13,23 @@ from matplotlib.patches import FancyBboxPatch
 import networkx as nx
 from openai import OpenAI
 
-# ── 共享状态（多用户并发访问，需要锁保护） ──────────────
-# agents  = { id: {id, name, role, prompt, color, x, y} }
-# edges   = [ {id, source, target} ]
+# ── 每用户独立状态 ──────────────────────────────────────
+# 每个浏览器 session 通过 gr.State 持有自己的 store，彼此完全不可见：
+#   store = {
+#       "agents":        { id: {id, name, role, prompt, model, color, x, y} },
+#       "edges":         [ {id, source, target} ],
+#       "conversations": { conv_id: [messages] },
+#   }
+# Gradio 会为每个 session 深拷贝一份默认值，所以 new_store() 返回的只是模板。
+# 注意：store 里不能放 threading.Lock —— deepcopy 复制不了锁对象。
+def new_store() -> dict:
+    return {"agents": {}, "edges": [], "conversations": {}}
+
+# 同一个 session 自己也可能并发触发事件（例如连点按钮），用一把模块级锁保护写操作。
+# 不同 session 操作的是各自的 store，这点争用可以忽略。
 _lock = threading.Lock()
-agents: dict[str, dict] = {}
-edges: list[dict] = []
-conversations: dict[str, list] = {}   # conv_id -> [messages]
-_active_users: set[str] = set()       # 在线 session id
+
+_active_users: set[str] = set()   # 在线 session_hash，仅用于人数显示
 
 COLORS = [
     "#e94560", "#3498db", "#2ecc71", "#9b59b6",
@@ -58,12 +67,15 @@ def llm_reply(agent: dict, history: list[dict], visible_ids: set[str] | None = N
 
 
 # ── 画布渲染 ───────────────────────────────────────────
-def render_canvas(bubbles: dict[str, str] | None = None,
+def render_canvas(store: dict,
+                  bubbles: dict[str, str] | None = None,
                   speaking_id: str | None = None) -> str:
     """用 matplotlib 绘制 agent 节点、连线和对话气泡，返回高清 PNG 路径。
+    store:       调用方 session 自己的状态
     bubbles:     {agent_id: 最新发言文本}  — 只显示 speaking_id 的气泡
     speaking_id: 当前正在说话的 agent id — 高亮其边框并显示气泡
     """
+    agents, edges = store["agents"], store["edges"]
     fig, ax = plt.subplots(figsize=(10, 7), dpi=200)
     fig.patch.set_facecolor("#ffffff")
     ax.set_facecolor("#ffffff")
@@ -134,7 +146,8 @@ def render_canvas(bubbles: dict[str, str] | None = None,
 
 
 # ── Agent CRUD ─────────────────────────────────────────
-def add_agent(name: str, role: str, prompt: str, model: str):
+def add_agent(store: dict, name: str, role: str, prompt: str, model: str):
+    agents = store["agents"]
     with _lock:
         if not name.strip():
             name = f"Agent-{len(agents)+1}"
@@ -150,39 +163,39 @@ def add_agent(name: str, role: str, prompt: str, model: str):
             "x": 120 + col * 180, "y": 400 - row * 150,
         }
     return (
-        render_canvas(),
-        agent_dropdown_choices(),
-        agent_dropdown_choices(),
-        agent_dropdown_choices(),
-        agent_checkbox_choices(),
+        render_canvas(store),
+        agent_dropdown_choices(store),
+        agent_dropdown_choices(store),
+        agent_dropdown_choices(store),
+        agent_checkbox_choices(store),
         gr.update(value=""),
         gr.update(value=""),
         gr.update(value=""),
         gr.update(value=""),
     )
 
-def delete_agent(selection: str):
+def delete_agent(store: dict, selection: str):
     with _lock:
         aid = _parse_id(selection)
-        if aid and aid in agents:
-            del agents[aid]
-            _remove_edges_for(aid)
+        if aid and aid in store["agents"]:
+            del store["agents"][aid]
+            _remove_edges_for(store, aid)
     return (
-        render_canvas(),
-        agent_dropdown_choices(),
-        agent_dropdown_choices(),
-        agent_dropdown_choices(),
-        agent_checkbox_choices(),
+        render_canvas(store),
+        agent_dropdown_choices(store),
+        agent_dropdown_choices(store),
+        agent_dropdown_choices(store),
+        agent_checkbox_choices(store),
     )
 
-def _remove_edges_for(aid: str):
-    global edges
-    edges = [e for e in edges if e["source"] != aid and e["target"] != aid]
+def _remove_edges_for(store: dict, aid: str):
+    store["edges"] = [e for e in store["edges"]
+                      if e["source"] != aid and e["target"] != aid]
 
-def _get_neighbors(aid: str) -> set[str]:
-    """根据 edges 返回与 aid 直接相连的所有 agent id"""
+def _get_neighbors(store: dict, aid: str) -> set[str]:
+    """根据 store 里的 edges 返回与 aid 直接相连的所有 agent id"""
     neighbors = set()
-    for e in edges:
+    for e in store["edges"]:
         if e["source"] == aid:
             neighbors.add(e["target"])
         elif e["target"] == aid:
@@ -197,15 +210,18 @@ def _parse_id(s: str) -> str | None:
         return s.rsplit("(", 1)[1][:-1].strip()
     return None
 
-def agent_dropdown_choices():
-    return gr.update(choices=[f'{a["name"]} ({a["id"]})' for a in agents.values()])
+def agent_dropdown_choices(store: dict):
+    return gr.update(choices=[f'{a["name"]} ({a["id"]})'
+                              for a in store["agents"].values()])
 
-def agent_checkbox_choices():
-    return gr.update(choices=[f'{a["name"]} ({a["id"]})' for a in agents.values()])
+def agent_checkbox_choices(store: dict):
+    return gr.update(choices=[f'{a["name"]} ({a["id"]})'
+                              for a in store["agents"].values()])
 
-def edge_dropdown_choices():
+def edge_dropdown_choices(store: dict):
+    agents = store["agents"]
     labels = []
-    for e in edges:
+    for e in store["edges"]:
         s = agents.get(e["source"], {}).get("name", "?")
         t = agents.get(e["target"], {}).get("name", "?")
         labels.append(f'{s} <-> {t} ({e["id"]})')
@@ -213,26 +229,25 @@ def edge_dropdown_choices():
 
 
 # ── 关系(Edge) ─────────────────────────────────────────
-def add_edge(src_sel: str, tgt_sel: str):
+def add_edge(store: dict, src_sel: str, tgt_sel: str):
     with _lock:
         src = _parse_id(src_sel)
         tgt = _parse_id(tgt_sel)
         if not src or not tgt or src == tgt:
-            return render_canvas(), edge_dropdown_choices()
-        for e in edges:
+            return render_canvas(store), edge_dropdown_choices(store)
+        for e in store["edges"]:
             if {e["source"], e["target"]} == {src, tgt}:
-                return render_canvas(), edge_dropdown_choices()
+                return render_canvas(store), edge_dropdown_choices(store)
         eid = str(uuid.uuid4())[:8]
-        edges.append({"id": eid, "source": src, "target": tgt})
-    return render_canvas(), edge_dropdown_choices()
+        store["edges"].append({"id": eid, "source": src, "target": tgt})
+    return render_canvas(store), edge_dropdown_choices(store)
 
-def delete_edge(selection: str):
+def delete_edge(store: dict, selection: str):
     with _lock:
         eid = _parse_id(selection)
         if eid:
-            global edges
-            edges = [e for e in edges if e["id"] != eid]
-    return render_canvas(), edge_dropdown_choices()
+            store["edges"] = [e for e in store["edges"] if e["id"] != eid]
+    return render_canvas(store), edge_dropdown_choices(store)
 
 
 # ── 对话 ───────────────────────────────────────────────
@@ -243,22 +258,23 @@ def _build_bubbles(history: list[dict]) -> dict[str, str]:
         latest[m["agent_id"]] = m["content"]
     return latest
 
-def start_conversation(agent_selections: list[str], topic: str, turns: int):
+def start_conversation(store: dict, agent_selections: list[str],
+                       topic: str, turns: int):
     """支持 N 个 agent 的群聊，按连线拓扑决定每个 agent 能听到谁。
     每轮同时 yield (画布, 文本日志) 让气泡实时显示在节点旁。
     """
     if not agent_selections or len(agent_selections) < 2:
-        yield render_canvas(), "Please select at least 2 agents to start a conversation."
+        yield render_canvas(store), "Please select at least 2 agents to start a conversation."
         return
 
     # 解析选中的 agent
     participants = []
     for sel in agent_selections:
         aid = _parse_id(sel)
-        if aid and aid in agents:
-            participants.append(agents[aid])
+        if aid and aid in store["agents"]:
+            participants.append(store["agents"][aid])
     if len(participants) < 2:
-        yield render_canvas(), "Need at least 2 valid agents."
+        yield render_canvas(store), "Need at least 2 valid agents."
         return
 
     participant_ids = {p["id"] for p in participants}
@@ -266,23 +282,24 @@ def start_conversation(agent_selections: list[str], topic: str, turns: int):
     # 检查连通性
     isolated = []
     for p in participants:
-        neighbors = _get_neighbors(p["id"]) & participant_ids
+        neighbors = _get_neighbors(store, p["id"]) & participant_ids
         if not neighbors:
             isolated.append(p["name"])
     if isolated:
         msg = (f"**Cannot start**: {', '.join(isolated)} ha{'s' if len(isolated)==1 else 've'} "
                f"no connections to other selected agents.\n\n"
                f"Please go to **Relations** tab and connect them first.")
-        yield render_canvas(), msg
+        yield render_canvas(store), msg
         return
 
     # 构建每个 agent 的可见集（邻居 ∩ 参与者）
     visibility: dict[str, set[str]] = {}
     topo_lines = []
     for p in participants:
-        visible = _get_neighbors(p["id"]) & participant_ids
+        visible = _get_neighbors(store, p["id"]) & participant_ids
         visibility[p["id"]] = visible
-        visible_names = [agents[vid]["name"] for vid in visible if vid in agents]
+        visible_names = [store["agents"][vid]["name"]
+                         for vid in visible if vid in store["agents"]]
         topo_lines.append(f"- **{p['name']}** hears: {', '.join(visible_names)}")
     topo_header = "**Topology:**\n" + "\n".join(topo_lines) + "\n\n---\n\n"
 
@@ -291,7 +308,7 @@ def start_conversation(agent_selections: list[str], topic: str, turns: int):
     opener = participants[0]
     opening = topic.strip() if topic.strip() else "Hello! Let's have a conversation."
     history.append({"agent_id": opener["id"], "name": opener["name"], "content": opening})
-    yield (render_canvas(_build_bubbles(history), opener["id"]),
+    yield (render_canvas(store, _build_bubbles(history), opener["id"]),
            topo_header + format_log(history))
 
     # 从第二个 agent 开始，轮流发言
@@ -300,13 +317,13 @@ def start_conversation(agent_selections: list[str], topic: str, turns: int):
         speaker = participants[(turn + 1) % n]
         reply = llm_reply(speaker, history, visible_ids=visibility[speaker["id"]])
         history.append({"agent_id": speaker["id"], "name": speaker["name"], "content": reply})
-        yield (render_canvas(_build_bubbles(history), speaker["id"]),
+        yield (render_canvas(store, _build_bubbles(history), speaker["id"]),
                topo_header + format_log(history))
 
     conv_id = str(uuid.uuid4())[:8]
-    conversations[conv_id] = history
+    store["conversations"][conv_id] = history
     # 最终帧：无高亮
-    yield (render_canvas(_build_bubbles(history)),
+    yield (render_canvas(store, _build_bubbles(history)),
            topo_header + format_log(history) + "\n\n--- Conversation finished ---")
 
 def format_log(history: list[dict]) -> str:
@@ -316,42 +333,58 @@ def format_log(history: list[dict]) -> str:
     return "\n\n".join(lines)
 
 
-# ── 同步刷新 ───────────────────────────────────────────
-def _refresh_all():
-    """返回最新画布 + 所有下拉列表，供多人实时同步"""
+# ── 刷新 / 在线人数 ─────────────────────────────────────
+def _refresh_all(store: dict):
+    """重绘画布并刷新所有下拉列表（手动 Refresh 按钮用）"""
     return (
-        render_canvas(),
-        agent_dropdown_choices(),
-        agent_dropdown_choices(),
-        agent_dropdown_choices(),
-        agent_checkbox_choices(),
-        edge_dropdown_choices(),
+        render_canvas(store),
+        agent_dropdown_choices(store),
+        agent_dropdown_choices(store),
+        agent_dropdown_choices(store),
+        agent_checkbox_choices(store),
+        edge_dropdown_choices(store),
     )
 
 def _user_count_text() -> str:
     n = len(_active_users)
-    return f"**{n}** user{'s' if n != 1 else ''} online"
+    return (f"**{n}** user{'s' if n != 1 else ''} online "
+            f"— each with a private workspace")
+
+def _session_id(request: gr.Request) -> str | None:
+    """用 Gradio 的 session_hash 标识会话。不要用 id(request)：那是内存地址，
+    对象被回收后会被复用，人数统计会漂。"""
+    return getattr(request, "session_hash", None)
 
 def _on_connect(request: gr.Request):
-    sid = str(id(request))
-    _active_users.add(sid)
+    sid = _session_id(request)
+    if sid:
+        with _lock:
+            _active_users.add(sid)
     return _user_count_text()
 
 def _on_disconnect(request: gr.Request):
-    sid = str(id(request))
-    _active_users.discard(sid)
+    sid = _session_id(request)
+    if sid:
+        with _lock:
+            _active_users.discard(sid)
 
 
 # ── Gradio UI ──────────────────────────────────────────
 with gr.Blocks(title="LLM Agent Platform") as app:
+    # 每个 session 一份独立状态，Gradio 为每个 session 深拷贝一份默认值
+    store = gr.State(new_store())
+
     gr.Markdown("# LLM Agent Platform\nCreate agents, connect them, and let them talk!\n\n"
-                "Share this link with others — everyone sees the same canvas in real time.")
+                "**Your workspace is private** — the agents, relations and conversations "
+                "you create are visible only to you. Note that reloading the page starts "
+                "a brand-new empty workspace.")
     status_bar = gr.Markdown(value=_user_count_text())
 
     with gr.Row():
         # ─ 左侧: 画布 ─
         with gr.Column(scale=3):
-            canvas = gr.Image(value=render_canvas, label="Agent Canvas", type="filepath")
+            canvas = gr.Image(value=lambda: render_canvas(new_store()),
+                              label="Agent Canvas", type="filepath")
 
         # ─ 右侧: 控制面板 ─
         with gr.Column(scale=2):
@@ -389,30 +422,29 @@ with gr.Blocks(title="LLM Agent Platform") as app:
 
     # ── Events ─────────────────────────────────────────
     add_btn.click(
-        add_agent, [a_name, a_role, a_prompt, a_model],
+        add_agent, [store, a_name, a_role, a_prompt, a_model],
         [canvas, src_dd, tgt_dd, del_dd, conv_agents, a_name, a_role, a_prompt, a_model],
     )
     del_btn.click(
-        delete_agent, [del_dd],
+        delete_agent, [store, del_dd],
         [canvas, src_dd, tgt_dd, del_dd, conv_agents],
     )
-    link_btn.click(add_edge, [src_dd, tgt_dd], [canvas, edge_dd])
-    unlink_btn.click(delete_edge, [edge_dd], [canvas, edge_dd])
+    link_btn.click(add_edge, [store, src_dd, tgt_dd], [canvas, edge_dd])
+    unlink_btn.click(delete_edge, [store, edge_dd], [canvas, edge_dd])
 
-    conv_btn.click(start_conversation, [conv_agents, conv_topic, conv_turns], [canvas, conv_log])
+    conv_btn.click(start_conversation,
+                   [store, conv_agents, conv_topic, conv_turns],
+                   [canvas, conv_log])
 
-    # 手动刷新：拉取其他用户的最新更改
+    # 手动重绘画布 / 刷新下拉列表
     refresh_btn.click(
-        _refresh_all, [],
+        _refresh_all, [store],
         [canvas, src_dd, tgt_dd, del_dd, conv_agents, edge_dd],
     )
 
-    # 自动定时刷新画布（每 5 秒），让多人协作保持同步
-    _timer = gr.Timer(value=5)
-    _timer.tick(
-        _refresh_all, [],
-        [canvas, src_dd, tgt_dd, del_dd, conv_agents, edge_dd],
-    )
+    # 这里原本有一个每 5 秒触发的 gr.Timer，用来把别人的改动同步过来。
+    # 状态改成每 session 独立之后没有"别人的改动"了，轮询只会让服务端
+    # 为每个在线用户每 5 秒重绘一张 200 DPI 的 PNG，纯属浪费，已移除。
 
     # 用户连接/断开时更新在线人数
     app.load(_on_connect, [], [status_bar])
